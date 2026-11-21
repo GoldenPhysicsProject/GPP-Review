@@ -75,13 +75,22 @@ jobs:
           FAILED=0
           for B in batch-*; do
             NOW=$(date +%s)
-            if [ "$NOW" -gt "$DEADLINE" ]; then
+            REMAINING=$((DEADLINE - NOW))
+            if [ "$REMAINING" -le 0 ]; then
               echo "DEADLINE-STOP: stopping before batch $B at $(date -u +%H:%M:%S)" | tee -a build.log
               break
             fi
             TARGETS=$(sed 's/$/:olean/' "$B" | tr '\n' ' ')
             echo "=== batch $B $(date -u +%H:%M:%S) ===" >> build.log
-            if ! lake build $TARGETS >> build.log 2>&1; then
+            RC=0
+            timeout --signal=TERM --kill-after=60 "${REMAINING}s" lake build $TARGETS >> build.log 2>&1 || RC=$?
+            if [ "$RC" -eq 124 ]; then
+              echo "DEADLINE-CUT: batch $B cut at internal deadline $(date -u +%H:%M:%S)" | tee -a build.log
+              pkill -x lean || true
+              sleep 3
+              break
+            fi
+            if [ "$RC" -ne 0 ]; then
               echo "BATCH-FAILED: $B" | tee -a build.log
               FAILED=1
               break
@@ -109,7 +118,7 @@ jobs:
           sleep 3
           echo "olean count: $(find .lake/build -name '*.olean' 2>/dev/null | wc -l)"
           echo "--- build result markers ---"
-          grep "BUILD-RESULT\|DEADLINE-STOP\|BATCH-FAILED" build.log || true
+          grep "BUILD-RESULT\|DEADLINE-STOP\|DEADLINE-CUT\|BATCH-FAILED" build.log || true
           echo "--- last 40 lines of build.log ---"
           tail -40 build.log || true
           df -h
