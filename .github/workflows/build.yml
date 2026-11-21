@@ -7,6 +7,10 @@ concurrency:
   group: build
   cancel-in-progress: false
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,33 +37,106 @@ jobs:
           export PATH="$HOME/.elan/bin:$PATH"
           lake exe cache get
 
-      - name: Restore project build cache
-        uses: actions/cache/restore@v4
-        with:
-          path: .lake/build
-          key: lake-build-${{ github.run_id }}
-          restore-keys: |
-            lake-build-
+      - name: Restore oleans from previous run's artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("lake-oleans-")) | select(.expired == false)] | sort_by(.created_at) | last | .id')
+          if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+            echo "Restoring artifact id $ID"
+            curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID/zip" -o oleans.zip
+            ls -la oleans.zip
+            mkdir -p .lake/build/lib
+            unzip -q -o oleans.zip -d .lake/build/lib
+            rm -f oleans.zip
+            if [ -d .lake/build/lib/lib/lean ]; then
+              echo "Normalising nested lib/ layout"
+              cp -a .lake/build/lib/lib/. .lake/build/lib/
+              rm -rf .lake/build/lib/lib
+            fi
+            echo "Restored olean count: $(find .lake/build -name '*.olean' | wc -l)"
+          else
+            echo "No previous oleans artifact found; starting fresh."
+          fi
 
-      - name: Build (resumable)
-        continue-on-error: true
+      - name: Build oleans (resumable, batched)
         timeout-minutes: 285
         run: |
           export PATH="$HOME/.elan/bin:$PATH"
-          lake build 2>&1 | tee build.log
+          START=$(date +%s)
+          DEADLINE=$((START + 16200))
+          find src -name '*.lean' | sort > all-modules.txt
+          TOTAL=$(wc -l < all-modules.txt)
+          echo "Total modules: $TOTAL" | tee build.log
+          split -l 250 -d -a 4 all-modules.txt batch-
+          FAILED=0
+          for B in batch-*; do
+            NOW=$(date +%s)
+            if [ "$NOW" -gt "$DEADLINE" ]; then
+              echo "DEADLINE-STOP: stopping before batch $B at $(date -u +%H:%M:%S)" | tee -a build.log
+              break
+            fi
+            TARGETS=$(sed 's/$/:olean/' "$B" | tr '\n' ' ')
+            echo "=== batch $B $(date -u +%H:%M:%S) ===" >> build.log
+            if ! lake build $TARGETS >> build.log 2>&1; then
+              echo "BATCH-FAILED: $B" | tee -a build.log
+              FAILED=1
+              break
+            fi
+            echo "batch $B done; oleans so far: $(find .lake/build -name '*.olean' | wc -l)"
+          done
+          rm -f batch-*
+          DONECOUNT=$(find .lake/build -name '*.olean' 2>/dev/null | wc -l)
+          echo "Oleans present after build step: $DONECOUNT / $TOTAL" | tee -a build.log
+          if [ "$FAILED" = "1" ]; then
+            echo "BUILD-RESULT: COMPILE-ERROR" | tee -a build.log
+            exit 1
+          fi
+          if [ "$DONECOUNT" -ge "$TOTAL" ]; then
+            echo "BUILD-RESULT: ALL-MODULES-BUILT" | tee -a build.log
+          else
+            echo "BUILD-RESULT: PARTIAL" | tee -a build.log
+          fi
 
       - name: Build progress snapshot
         if: always()
         run: |
+          pkill -x lean || true
+          pkill -x lake || true
+          sleep 3
           echo "olean count: $(find .lake/build -name '*.olean' 2>/dev/null | wc -l)"
+          echo "--- build result markers ---"
+          grep "BUILD-RESULT\|DEADLINE-STOP\|BATCH-FAILED" build.log || true
           echo "--- last 40 lines of build.log ---"
           tail -40 build.log || true
           df -h
-          du -sh .lake/build || true
+          du -sh .lake/build .lake/build/lib .lake/build/lib/lean .lake/build/ir 2>/dev/null || true
 
-      - name: Save project build cache
+      - name: Upload oleans artifact
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/upload-artifact@v4
         with:
-          path: .lake/build
-          key: lake-build-${{ github.run_id }}
+          name: lake-oleans-${{ github.run_id }}
+          path: .lake/build/lib
+          compression-level: 0
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Delete older oleans artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '[.artifacts[] | select(.name | startswith("lake-oleans-"))] | sort_by(.created_at) | .[0:-1] | .[].id' \
+          | while read -r OLD; do
+              echo "Deleting old artifact $OLD"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$OLD"
+            done
+          echo "Remaining oleans artifacts:"
+          gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("lake-oleans-")) | "\(.id) \(.name) \(.size_in_bytes)"'
